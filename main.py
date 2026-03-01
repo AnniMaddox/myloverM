@@ -49,6 +49,12 @@ MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 # 每次注入的最大记忆条数
 MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 
+# 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
+MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
+
+# 轮次计数器
+_round_counter = 0
+
 # 额外的请求头（有些 API 需要，比如 OpenRouter 需要 Referer）
 EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
 EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
@@ -103,7 +109,7 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
 
 
 # ============================================================
@@ -131,8 +137,21 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
         enhanced_prompt = f"""{SYSTEM_PROMPT}
 
 【从过往对话中检索到的相关记忆】
-以下是与当前话题可能相关的历史信息，自然地融入对话中，不要刻意提起"我记得"：
-{memory_text}"""
+{memory_text}
+
+# 记忆应用
+- 像朋友般自然运用这些记忆，不刻意展示
+- 仅在相关话题出现时引用，避免主动提及
+- 对重要信息（如健康、日期、约定）保持一致性
+- 新信息与记忆冲突时，以新信息为准
+- 模糊记忆可表达不确定性："记得你似乎说过..."
+
+# 交流方式
+- 自然引用："记得你说过..."或"上次我们聊到..."
+- 避免机械式表达如"根据我的记忆..."或"检索到的信息显示..."
+- 共同经历可温情回忆："上次那个事挺好玩的"
+
+记忆是丰富对话的工具，而非对话焦点。"""
         
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return enhanced_prompt
@@ -146,20 +165,58 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
 # 后台记忆处理
 # ============================================================
 
-async def process_memories_background(session_id: str, user_msg: str, assistant_msg: str, model: str):
-    """后台异步：存储对话 + 提取记忆（不阻塞主流程）"""
+async def process_memories_background(session_id: str, user_msg: str, assistant_msg: str, model: str, context_messages: list = None):
+    """
+    后台异步：存储对话 + 提取记忆（不阻塞主流程）
+    
+    记忆提取受 MEMORY_EXTRACT_INTERVAL 控制：
+    - 0: 禁用自动提取
+    - 1: 每轮提取（默认）
+    - N: 每 N 轮提取一次
+    对话记录始终保存，不受间隔影响。
+    
+    context_messages: 客户端发来的原始对话上下文（不含system prompt），
+                      用于让提取模型从完整上下文中提取记忆。
+    """
+    global _round_counter
+    
     try:
+        # 1. 存储对话记录（始终执行，只存最新一轮避免重复）
         await save_message(session_id, "user", user_msg, model)
         await save_message(session_id, "assistant", assistant_msg, model)
         
-        # 获取已有记忆，传给提取模型做对比去重
+        # 2. 检查是否需要提取记忆
+        if MEMORY_EXTRACT_INTERVAL == 0:
+            print(f"⏭️  记忆自动提取已禁用，跳过")
+            return
+        
+        _round_counter += 1
+        
+        if MEMORY_EXTRACT_INTERVAL > 1 and (_round_counter % MEMORY_EXTRACT_INTERVAL != 0):
+            print(f"⏭️  轮次 {_round_counter}，跳过记忆提取（每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次）")
+            return
+        
+        if MEMORY_EXTRACT_INTERVAL > 1:
+            print(f"📝 轮次 {_round_counter}，执行记忆提取")
+        
+        # 3. 获取已有记忆，传给提取模型做对比去重
         existing = await get_recent_memories(limit=80)
         existing_contents = [r["content"] for r in existing]
         
-        messages_for_extraction = [
-            {"role": "user", "content": user_msg},
-            {"role": "assistant", "content": assistant_msg},
-        ]
+        # 4. 构建用于提取的消息列表
+        #    如果有完整上下文，用完整上下文 + 最新assistant回复
+        #    否则只用最新一轮（兼容旧行为）
+        if context_messages:
+            messages_for_extraction = list(context_messages) + [
+                {"role": "assistant", "content": assistant_msg}
+            ]
+            print(f"📝 使用完整上下文提取记忆（{len(messages_for_extraction)} 条消息）")
+        else:
+            messages_for_extraction = [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": assistant_msg},
+            ]
+        
         new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
         
         # 过滤垃圾记忆（不靠模型自觉，硬过滤）
@@ -210,11 +267,12 @@ async def health_check():
     
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v1.0",
+        "gateway": "AI Memory Gateway v2.0",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
         "memory_count": memory_count,
+        "memory_extract_interval": MEMORY_EXTRACT_INTERVAL,
     }
 
 
@@ -261,6 +319,9 @@ async def chat_completions(request: Request):
             break
     
     # ---------- 构建 system prompt ----------
+    # 先保存原始对话消息（不含 system prompt），用于记忆提取
+    original_messages = [msg for msg in messages if msg.get("role") != "system"]
+    
     if SYSTEM_PROMPT or (MEMORY_ENABLED and user_message):
         if MEMORY_ENABLED and user_message:
             enhanced_prompt = await build_system_prompt_with_memories(user_message)
@@ -302,7 +363,7 @@ async def chat_completions(request: Request):
     
     if is_stream:
         return StreamingResponse(
-            stream_and_capture(headers, body, session_id, user_message, model),
+            stream_and_capture(headers, body, session_id, user_message, model, original_messages),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -320,7 +381,7 @@ async def chat_completions(request: Request):
                 
                 if MEMORY_ENABLED and user_message and assistant_msg:
                     asyncio.create_task(
-                        process_memories_background(session_id, user_message, assistant_msg, model)
+                        process_memories_background(session_id, user_message, assistant_msg, model, context_messages=original_messages)
                     )
                 
                 return JSONResponse(status_code=200, content=resp_data)
@@ -328,7 +389,7 @@ async def chat_completions(request: Request):
                 return JSONResponse(status_code=response.status_code, content=response.json())
 
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str):
+async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, original_messages: list = None):
     """流式响应 + 捕获完整回复"""
     full_response = []
     
@@ -350,7 +411,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     assistant_msg = "".join(full_response)
     if MEMORY_ENABLED and user_message and assistant_msg:
         asyncio.create_task(
-            process_memories_background(session_id, user_message, assistant_msg, model)
+            process_memories_background(session_id, user_message, assistant_msg, model, context_messages=original_messages)
         )
 
 
@@ -931,4 +992,5 @@ if __name__ == "__main__":
     print(f"🤖 默认模型：{DEFAULT_MODEL}")
     print(f"🔗 API 地址：{API_BASE_URL}")
     print(f"🧠 记忆系统：{'开启' if MEMORY_ENABLED else '关闭'}")
+    print(f"🔄 记忆提取间隔：{'禁用' if MEMORY_EXTRACT_INTERVAL == 0 else '每轮提取' if MEMORY_EXTRACT_INTERVAL == 1 else f'每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次'}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
