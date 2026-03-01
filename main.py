@@ -213,13 +213,16 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         existing_contents = [r["content"] for r in existing]
         
         # 4. 构建用于提取的消息列表
-        #    如果有完整上下文，用完整上下文 + 最新assistant回复
-        #    否则只用最新一轮（兼容旧行为）
+        #    截取最近 MEMORY_EXTRACT_INTERVAL 轮对话（每轮=user+assistant共2条）
+        #    而非发送完整上下文，省token
         if context_messages:
-            messages_for_extraction = list(context_messages) + [
+            # 截取最近N轮（interval×2条），加上最新的assistant回复
+            tail_count = MEMORY_EXTRACT_INTERVAL * 2
+            recent_msgs = list(context_messages)[-tail_count:] if len(context_messages) > tail_count else list(context_messages)
+            messages_for_extraction = recent_msgs + [
                 {"role": "assistant", "content": assistant_msg}
             ]
-            print(f"📝 使用完整上下文提取记忆（{len(messages_for_extraction)} 条消息）")
+            print(f"📝 截取最近 {MEMORY_EXTRACT_INTERVAL} 轮对话提取记忆（{len(messages_for_extraction)} 条消息）")
         else:
             messages_for_extraction = [
                 {"role": "user", "content": user_msg},
