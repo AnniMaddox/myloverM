@@ -90,61 +90,76 @@ async def init_tables():
 
 
 # ============================================================
-# 中文分词工具
+# 中文分词工具（基于 jieba）
 # ============================================================
 
-CJK_PATTERN = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
-EN_WORD_PATTERN = re.compile(r'[a-zA-Z0-9]+')
+import jieba
+import jieba.analyse
+
+# 静默加载词典
+jieba.setLogLevel(jieba.logging.INFO)
+
+EN_WORD_PATTERN = re.compile(r'[a-zA-Z][a-zA-Z0-9]*')
 NUM_PATTERN = re.compile(r'\d{2,}')
+
+# 中文停用词（高频但无搜索价值的词）
+_STOP_WORDS = frozenset({
+    "的", "了", "在", "是", "我", "你", "他", "她", "它", "们",
+    "这", "那", "有", "和", "与", "也", "都", "又", "就", "但",
+    "而", "或", "到", "被", "把", "让", "从", "对", "为", "以",
+    "及", "等", "个", "不", "没", "很", "太", "吗", "呢", "吧",
+    "啊", "嗯", "哦", "哈", "呀", "嘛", "么", "啦", "哇", "喔",
+    "会", "能", "要", "想", "去", "来", "说", "做", "看", "给",
+    "上", "下", "里", "中", "大", "小", "多", "少", "好", "可以",
+    "什么", "怎么", "如何", "哪里", "哪个", "为什么", "还是",
+    "然后", "因为", "所以", "虽然", "但是", "可以", "已经",
+    "一个", "一些", "一下", "一点", "一起", "一样",
+    "比较", "应该", "可能", "如果", "这个", "那个",
+    "自己", "知道", "觉得", "感觉", "时候", "现在",
+})
 
 
 def extract_search_keywords(query: str) -> List[str]:
     """
-    从查询中提取搜索关键词
-    
-    中文：提取连续中文片段，拆成2字和3字词组（滑动窗口）
-    英文：按空格分词
-    数字：保留完整数字串（年份等）
-    
+    从查询中提取搜索关键词（使用 jieba 分词）
+
+    中文：用 jieba 分词后过滤停用词和单字
+    英文：按正则提取完整单词
+    数字：保留2位及以上的数字串（年份、日期等）
+
     例如：
-    "春节干了什么" → ["春节", "节干", "干了", "了什", "什么", "春节干", "节干了", "干了什", "了什么"]
+    "我昨天在手机上部署了Render然后吃了晚饭" → ["昨天", "手机", "部署", "Render", "晚饭"]
+    "春节干了什么" → ["春节"]
     "Garan春节"   → ["Garan", "春节"]
     "2026除夕"    → ["2026", "除夕"]
     """
     keywords = set()
-    
+
+    # 英文单词（2字符以上）
     for match in EN_WORD_PATTERN.finditer(query):
         word = match.group()
         if len(word) >= 2:
             keywords.add(word)
-    
+
+    # 数字串（年份、日期等）
     for match in NUM_PATTERN.finditer(query):
         keywords.add(match.group())
-    
-    chinese_chars = []
-    for char in query:
-        if CJK_PATTERN.match(char):
-            chinese_chars.append(char)
-        else:
-            if len(chinese_chars) >= 2:
-                _add_chinese_ngrams(chinese_chars, keywords)
-            chinese_chars = []
-    if len(chinese_chars) >= 2:
-        _add_chinese_ngrams(chinese_chars, keywords)
-    
+
+    # 中文分词（jieba）
+    words = jieba.cut(query, cut_all=False)
+    for word in words:
+        word = word.strip()
+        if not word:
+            continue
+        # 跳过纯英文/数字（已在上面处理）
+        if EN_WORD_PATTERN.fullmatch(word) or NUM_PATTERN.fullmatch(word):
+            continue
+        # 跳过单字和停用词
+        if len(word) < 2 or word in _STOP_WORDS:
+            continue
+        keywords.add(word)
+
     return list(keywords)
-
-
-def _add_chinese_ngrams(chars: List[str], keywords: set):
-    """把连续中文字符拆成2字和3字词组"""
-    text = "".join(chars)
-    if len(text) <= 3:
-        keywords.add(text)
-    for i in range(len(text) - 1):
-        keywords.add(text[i:i+2])
-    if len(text) >= 3:
-        for i in range(len(text) - 2):
-            keywords.add(text[i:i+3])
 
 
 # ============================================================
