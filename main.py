@@ -114,6 +114,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
+from fastapi.middleware.cors import CORSMiddleware
+import os
+
+raw = os.getenv("CORS_ORIGINS", "")
+origins = [x.strip() for x in raw.split(",") if x.strip()]
+
+app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+)
 
 
 # ============================================================
