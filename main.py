@@ -12,18 +12,54 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 环境变量 MEMORY_ENABLED=false 时退化为纯转发网关（第一阶段）。
 """
 
-import os
-import json
-import uuid
 import asyncio
-import httpx
-from datetime import datetime, timedelta, timezone
+import json
+import os
+import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch
-from memory_extractor import extract_memories, score_memories
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+from database import (
+    ACTIVE_STATUS,
+    MEMORY_TIER_EPHEMERAL,
+    MEMORY_TIER_EVERGREEN,
+    MEMORY_TIER_STABLE,
+    add_memory_confirmation,
+    close_pool,
+    count_distinct_confirmations,
+    create_open_loop,
+    delete_memories_batch,
+    delete_memory,
+    expire_old_memories,
+    expire_old_open_loops,
+    get_active_memory_briefs,
+    get_all_memories,
+    get_all_memories_count,
+    get_all_memories_detail,
+    get_first_confirmation_time,
+    get_latest_summary_time,
+    get_memories_by_tier,
+    get_memory,
+    get_open_loops,
+    get_pool,
+    get_recent_session_summaries,
+    get_session_messages,
+    get_stale_unsummarized_sessions,
+    init_tables,
+    resolve_open_loops,
+    save_memory,
+    save_message,
+    search_memories,
+    update_memory,
+    upsert_session_summary,
+)
+from memory_extractor import extract_memory_actions, score_memories, summarize_session
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -49,12 +85,22 @@ MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 
 # 每次注入的最大记忆条数
 MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
+MAX_EVERGREEN_INJECT = int(os.getenv("MAX_EVERGREEN_INJECT", "12"))
+MAX_STABLE_INJECT = int(os.getenv("MAX_STABLE_INJECT", str(MAX_MEMORIES_INJECT)))
+MAX_EPHEMERAL_INJECT = int(os.getenv("MAX_EPHEMERAL_INJECT", "8"))
+MAX_SUMMARIES_INJECT = int(os.getenv("MAX_SUMMARIES_INJECT", "2"))
+MAX_OPEN_LOOPS_INJECT = int(os.getenv("MAX_OPEN_LOOPS_INJECT", "8"))
 
 # 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
 
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
+SESSION_IDLE_MINUTES = int(os.getenv("SESSION_IDLE_MINUTES", "30"))
+MIN_MESSAGES_FOR_SUMMARY = int(os.getenv("MIN_MESSAGES_FOR_SUMMARY", "4"))
+EPHEMERAL_CONFIRMATIONS_TO_STABLE = int(os.getenv("EPHEMERAL_CONFIRMATIONS_TO_STABLE", "3"))
+STABLE_CONFIRMATIONS_TO_REVIEW = int(os.getenv("STABLE_CONFIRMATIONS_TO_REVIEW", "5"))
+STABLE_REVIEW_DAYS = int(os.getenv("STABLE_REVIEW_DAYS", "14"))
 
 # 轮次计数器
 _round_counter = 0
@@ -62,6 +108,32 @@ _round_counter = 0
 # 额外的请求头（有些 API 需要，比如 OpenRouter 需要 Referer）
 EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
 EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
+
+META_BLACKLIST = [
+    "记忆库",
+    "记忆系统",
+    "检索",
+    "没有被记录",
+    "没有被提取",
+    "记忆遗漏",
+    "尚未被记录",
+    "写入不完整",
+    "检索功能",
+    "系统没有返回",
+    "关键词匹配",
+    "语义匹配",
+    "语义检索",
+    "阈值",
+    "数据库",
+    "seed",
+    "导入",
+    "部署",
+    "bug",
+    "debug",
+    "端口",
+    "网关",
+]
+SKIPPED_SUMMARY_PREFIX = "【短会话略过】"
 
 
 # ============================================================
@@ -114,8 +186,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
-from fastapi.middleware.cors import CORSMiddleware
-import os
 
 raw = os.getenv("CORS_ORIGINS", "")
 origins = [x.strip() for x in raw.split(",") if x.strip()]
@@ -133,60 +203,317 @@ app.add_middleware(
 # 记忆注入
 # ============================================================
 
+def row_get(row: Any, key: str, default=None):
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+
+def local_now() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)
+
+
+def format_local_datetime(value: datetime | None) -> str:
+    if not value:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    local_dt = value.astimezone(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)
+    return local_dt.strftime("%Y-%m-%d %H:%M")
+
+
+def format_relative_time(value: datetime | None) -> str:
+    if not value:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - value.astimezone(timezone.utc)
+    seconds = int(max(delta.total_seconds(), 0))
+    if seconds < 3600:
+        return f"{max(seconds // 60, 1)} 分钟"
+    if seconds < 86400:
+        return f"{seconds // 3600} 小时"
+    return f"{seconds // 86400} 天"
+
+
+def extract_text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = str(item.get("text", "")).strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts).strip()
+    return ""
+
+
+def normalize_messages_for_memory(messages: list[dict]) -> list[dict]:
+    normalized = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "system":
+            continue
+        content = extract_text_from_content(msg.get("content"))
+        if not content:
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def normalize_text_key(text: str) -> str:
+    return "".join(text.lower().split())
+
+
+def is_meta_memory(content: str) -> bool:
+    return any(keyword in content for keyword in META_BLACKLIST)
+
+
+def build_valid_until(valid_until_days: Any) -> datetime | None:
+    try:
+        days = int(valid_until_days)
+    except (TypeError, ValueError):
+        return None
+    if days <= 0:
+        return None
+    return datetime.now(timezone.utc) + timedelta(days=days)
+
+
+def format_memory_line(memory: Any, include_date: bool = False) -> str:
+    content = str(row_get(memory, "content", "") or "").strip()
+    if not content:
+        return ""
+    if not include_date:
+        return f"- {content}"
+    created_at = row_get(memory, "created_at")
+    if not created_at:
+        return f"- {content}"
+    date_str = format_local_datetime(created_at)
+    return f"- [{date_str}] {content}"
+
+
+def build_memory_lookup(memories: list[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
+    by_content: dict[str, dict] = {}
+    by_key: dict[str, dict] = {}
+    for mem in memories:
+        content = str(row_get(mem, "content", "") or "").strip()
+        canonical_key = str(row_get(mem, "canonical_key", "") or "").strip()
+        if content:
+            by_content.setdefault(normalize_text_key(content), mem)
+        if canonical_key:
+            by_key.setdefault(canonical_key, mem)
+    return by_content, by_key
+
+
+async def maybe_promote_memory(memory_id: int):
+    memory = await get_memory(memory_id)
+    if not memory:
+        return
+    if row_get(memory, "status") != ACTIVE_STATUS or row_get(memory, "manual_locked", False):
+        return
+
+    confirmations = await count_distinct_confirmations(memory_id)
+    tier = row_get(memory, "tier")
+
+    if tier == MEMORY_TIER_EPHEMERAL and confirmations >= EPHEMERAL_CONFIRMATIONS_TO_STABLE:
+        await update_memory(memory_id, tier=MEMORY_TIER_STABLE)
+        print(f"⬆️  记忆 #{memory_id} 已从 ephemeral 升级为 stable")
+        memory = await get_memory(memory_id)
+        tier = row_get(memory, "tier")
+
+    if tier != MEMORY_TIER_STABLE or row_get(memory, "pending_review", False):
+        return
+
+    if confirmations < STABLE_CONFIRMATIONS_TO_REVIEW:
+        return
+
+    first_confirmation = await get_first_confirmation_time(memory_id)
+    if not first_confirmation:
+        return
+    if datetime.now(timezone.utc) - first_confirmation < timedelta(days=STABLE_REVIEW_DAYS):
+        return
+
+    await update_memory(memory_id, pending_review=True)
+    print(f"🪄  stable 记忆 #{memory_id} 已进入 evergreen review queue")
+
+
+async def save_action_memory(action: dict, source_session: str) -> int | None:
+    return await save_memory(
+        content=action["content"],
+        importance=action.get("importance", 5),
+        source_session=source_session,
+        tier=action.get("tier", MEMORY_TIER_EPHEMERAL),
+        status=ACTIVE_STATUS,
+        canonical_key=action.get("canonical_key"),
+        valid_until=build_valid_until(action.get("valid_until_days")),
+    )
+
+
+async def handle_memory_conflict(action: dict, source_session: str):
+    target_id = action.get("memory_id")
+    target = await get_memory(target_id)
+    if not target:
+        await save_action_memory(action, source_session)
+        return
+
+    if row_get(target, "manual_locked", False):
+        await save_action_memory(action, source_session)
+        print(f"🔒  记忆 #{target_id} 已锁定，冲突内容作为新记忆追加")
+        return
+
+    new_memory_id = await save_action_memory(action, source_session)
+    if not new_memory_id:
+        return
+
+    target_tier = row_get(target, "tier")
+    if target_tier == MEMORY_TIER_EPHEMERAL:
+        await update_memory(target_id, status="superseded", replaced_by_id=new_memory_id)
+        print(f"♻️  临时记忆 #{target_id} 被新记忆 #{new_memory_id} 取代")
+    else:
+        await update_memory(target_id, status="conflicted")
+        print(f"⚠️  记忆 #{target_id} 被标记为 conflicted，新版本为 #{new_memory_id}")
+
+
+async def summarize_stale_sessions(limit: int = 3):
+    stale_sessions = await get_stale_unsummarized_sessions(
+        idle_minutes=SESSION_IDLE_MINUTES,
+        limit=limit,
+    )
+    for row in stale_sessions:
+        session_id = row_get(row, "session_id")
+        msg_count = int(row_get(row, "msg_count", 0) or 0)
+        if not session_id:
+            continue
+        if msg_count < MIN_MESSAGES_FOR_SUMMARY:
+            await upsert_session_summary(
+                session_id,
+                f"{SKIPPED_SUMMARY_PREFIX} {msg_count} 条消息",
+                mood=None,
+                topic_tags=["short-session"],
+                msg_count=msg_count,
+            )
+            continue
+
+        messages = await get_session_messages(session_id)
+        normalized_messages = [
+            {"role": row_get(message, "role", ""), "content": row_get(message, "content", "")}
+            for message in messages
+            if row_get(message, "content", "")
+        ]
+        summary_data = await summarize_session(normalized_messages)
+        summary_text = summary_data.get("summary", "").strip()
+        if not summary_text:
+            continue
+        await upsert_session_summary(
+            session_id,
+            summary_text,
+            mood=summary_data.get("mood"),
+            topic_tags=summary_data.get("topic_tags") or [],
+            msg_count=msg_count,
+        )
+        print(f"🧾 已生成 session 摘要: {session_id}")
+
+
 async def build_system_prompt_with_memories(user_message: str) -> str:
     """
-    构建带记忆的 system prompt
-    1. 用用户消息搜索相关记忆
-    2. 格式化成文本拼接到人设后面
+    构建带分层记忆的 system prompt。
     """
     if not MEMORY_ENABLED:
         return SYSTEM_PROMPT
-    
+
     try:
-        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
-        
-        if not memories:
+        evergreen = await get_memories_by_tier(MEMORY_TIER_EVERGREEN, limit=MAX_EVERGREEN_INJECT)
+        stable = await search_memories(
+            user_message,
+            limit=MAX_STABLE_INJECT,
+            tiers=[MEMORY_TIER_STABLE],
+            statuses=[ACTIVE_STATUS],
+        )
+        recent_summaries = await get_recent_session_summaries(limit=MAX_SUMMARIES_INJECT)
+        open_loops = await get_open_loops(status="open", limit=MAX_OPEN_LOOPS_INJECT)
+        ephemeral = await get_memories_by_tier(
+            MEMORY_TIER_EPHEMERAL,
+            limit=MAX_EPHEMERAL_INJECT,
+            days=3,
+            touch=False,
+        )
+        latest_summary_time = await get_latest_summary_time()
+
+        sections = []
+
+        evergreen_lines = [format_memory_line(mem) for mem in evergreen]
+        evergreen_lines = [line for line in evergreen_lines if line]
+        if evergreen_lines:
+            sections.append("【核心长期记忆】\n" + "\n".join(evergreen_lines))
+
+        stable_lines = [format_memory_line(mem, include_date=True) for mem in stable]
+        stable_lines = [line for line in stable_lines if line]
+        if stable_lines:
+            sections.append("【相关稳定记忆】\n" + "\n".join(stable_lines))
+
+        summary_lines = []
+        for summary in recent_summaries:
+            summary_text = str(row_get(summary, "summary", "") or "").strip()
+            if not summary_text or summary_text.startswith(SKIPPED_SUMMARY_PREFIX):
+                continue
+            mood = str(row_get(summary, "mood", "") or "").strip()
+            prefix = f"- ({mood}) " if mood else "- "
+            summary_lines.append(prefix + summary_text)
+        if summary_lines:
+            sections.append("【最近会话摘要】\n" + "\n".join(summary_lines))
+
+        loop_lines = []
+        for loop in open_loops:
+            content = str(row_get(loop, "content", "") or "").strip()
+            if not content:
+                continue
+            loop_type = str(row_get(loop, "loop_type", "") or "").strip()
+            if loop_type:
+                loop_lines.append(f"- [{loop_type}] {content}")
+            else:
+                loop_lines.append(f"- {content}")
+        if loop_lines:
+            sections.append("【未完事项】\n" + "\n".join(loop_lines))
+
+        ephemeral_lines = [format_memory_line(mem, include_date=True) for mem in ephemeral]
+        ephemeral_lines = [line for line in ephemeral_lines if line]
+        if ephemeral_lines:
+            sections.append("【近期短期状态】\n" + "\n".join(ephemeral_lines))
+
+        if not sections:
             return SYSTEM_PROMPT
-        
-        # 格式化记忆文本（带日期，帮助模型判断新旧）
-        memory_lines = []
-        for mem in memories:
-            date_str = ""
-            if mem.get("created_at"):
-                try:
-                    utc_str = str(mem['created_at'])[:19]
-                    utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    local_dt = utc_dt + timedelta(hours=TIMEZONE_HOURS)
-                    date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
-                except:
-                    date_str = f"[{str(mem['created_at'])[:10]}] "
-            memory_lines.append(f"- {date_str}{mem['content']}")
-        memory_text = "\n".join(memory_lines)
-        
+
+        time_lines = [f"- 当前本地时间：{local_now().strftime('%Y-%m-%d %H:%M')}"]
+        if latest_summary_time:
+            time_lines.append(f"- 最近一段已总结的会话大约在 {format_relative_time(latest_summary_time)} 前。")
+        sections.insert(0, "【时间参考】\n" + "\n".join(time_lines))
+
+        if len(sections) == 1 and not SYSTEM_PROMPT:
+            return sections[0]
+
         enhanced_prompt = f"""{SYSTEM_PROMPT}
 
-【从过往对话中检索到的相关记忆】
-{memory_text}
+{chr(10).join(sections)}
 
-# 记忆应用
-- 像朋友般自然运用这些记忆，不刻意展示
-- 仅在相关话题出现时引用，避免主动提及
-- 对重要信息（如健康、日期、约定）保持一致性
-- 新信息与记忆冲突时，以新信息为准
-- 模糊记忆可表达不确定性："记得你似乎说过..."
+# 使用方式
+- 这些内容只是辅助你接住上下文，不要机械复述。
+- 优先使用核心长期记忆和相关稳定记忆；短期状态只在相关时轻描淡写带一下。
+- open loops 是待追问或待完成事项，合适时自然接上。
+- 若当前用户消息与旧记忆冲突，以当前明确新信息为准。"""
 
-# 交流方式
-- 自然引用："记得你说过..."或"上次我们聊到..."
-- 避免机械式表达如"根据我的记忆..."或"检索到的信息显示..."
-- 共同经历可温情回忆："上次那个事挺好玩的"
-
-记忆是丰富对话的工具，而非对话焦点。"""
-        
-        print(f"📚 注入了 {len(memories)} 条相关记忆")
+        total_count = len(evergreen_lines) + len(stable_lines) + len(summary_lines) + len(loop_lines) + len(ephemeral_lines)
+        print(f"📚 注入了分层上下文，共 {total_count} 条片段")
         return enhanced_prompt
-        
-    except Exception as e:
-        print(f"⚠️  记忆检索失败: {e}，使用纯人设")
+
+    except Exception as exc:
+        print(f"⚠️  记忆检索失败: {exc}，使用纯人设")
         return SYSTEM_PROMPT
 
 
@@ -194,93 +521,134 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
 # 后台记忆处理
 # ============================================================
 
-async def process_memories_background(session_id: str, user_msg: str, assistant_msg: str, model: str, context_messages: list = None):
+async def process_memories_background(
+    session_id: str,
+    user_msg: str,
+    assistant_msg: str,
+    model: str,
+    context_messages: list | None = None,
+    has_stable_session_id: bool = False,
+):
     """
     后台异步：存储对话 + 提取记忆（不阻塞主流程）
-    
-    记忆提取受 MEMORY_EXTRACT_INTERVAL 控制：
-    - 0: 禁用自动提取
-    - 1: 每轮提取（默认）
-    - N: 每 N 轮提取一次
-    对话记录始终保存，不受间隔影响。
-    
-    context_messages: 客户端发来的原始对话上下文（不含system prompt），
-                      用于让提取模型从完整上下文中提取记忆。
     """
     global _round_counter
-    
+
     try:
-        # 1. 存储对话记录（始终执行，只存最新一轮避免重复）
         await save_message(session_id, "user", user_msg, model)
         await save_message(session_id, "assistant", assistant_msg, model)
-        
-        # 2. 检查是否需要提取记忆
+
         if MEMORY_EXTRACT_INTERVAL == 0:
-            print(f"⏭️  记忆自动提取已禁用，跳过")
+            if has_stable_session_id:
+                await summarize_stale_sessions()
+            print("⏭️  记忆自动提取已禁用，跳过")
             return
-        
+
         _round_counter += 1
-        
         if MEMORY_EXTRACT_INTERVAL > 1 and (_round_counter % MEMORY_EXTRACT_INTERVAL != 0):
+            if has_stable_session_id:
+                await summarize_stale_sessions()
             print(f"⏭️  轮次 {_round_counter}，跳过记忆提取（每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次）")
             return
-        
+
         if MEMORY_EXTRACT_INTERVAL > 1:
             print(f"📝 轮次 {_round_counter}，执行记忆提取")
-        
-        # 3. 获取已有记忆，传给提取模型做对比去重
-        existing = await get_recent_memories(limit=80)
-        existing_contents = [r["content"] for r in existing]
-        
-        # 4. 构建用于提取的消息列表
-        #    截取最近 MEMORY_EXTRACT_INTERVAL 轮对话（每轮=user+assistant共2条）
-        #    而非发送完整上下文，省token
+
         if context_messages:
-            # 截取最近N轮（interval×2条），加上最新的assistant回复
             tail_count = MEMORY_EXTRACT_INTERVAL * 2
             recent_msgs = list(context_messages)[-tail_count:] if len(context_messages) > tail_count else list(context_messages)
-            messages_for_extraction = recent_msgs + [
-                {"role": "assistant", "content": assistant_msg}
-            ]
+            messages_for_extraction = recent_msgs + [{"role": "assistant", "content": assistant_msg}]
             print(f"📝 截取最近 {MEMORY_EXTRACT_INTERVAL} 轮对话提取记忆（{len(messages_for_extraction)} 条消息）")
         else:
             messages_for_extraction = [
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": assistant_msg},
             ]
-        
-        new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
-        
-        # 过滤垃圾记忆（不靠模型自觉，硬过滤）
-        META_BLACKLIST = [
-            "记忆库", "记忆系统", "检索", "没有被记录", "没有被提取",
-            "记忆遗漏", "尚未被记录", "写入不完整", "检索功能",
-            "系统没有返回", "关键词匹配", "语义匹配", "语义检索",
-            "阈值", "数据库", "seed", "导入", "部署",
-            "bug", "debug", "端口", "网关",
-        ]
-        
-        filtered_memories = []
-        for mem in new_memories:
-            content = mem["content"]
-            if any(kw in content for kw in META_BLACKLIST):
-                print(f"🚫 过滤掉meta记忆: {content[:60]}...")
+
+        existing_memories = [dict(row) for row in await get_active_memory_briefs(limit=60)]
+        existing_by_content, existing_by_key = build_memory_lookup(existing_memories)
+        open_loops = [dict(row) for row in await get_open_loops(status="open", limit=20)]
+        extraction_result = await extract_memory_actions(
+            messages_for_extraction,
+            existing_memories=existing_memories,
+            open_loops=open_loops,
+        )
+
+        saved_count = 0
+        confirmation_count = 0
+        conflict_count = 0
+
+        for action in extraction_result["memory_actions"]:
+            action_type = action.get("action")
+            if action_type in {"create", "conflict"} and is_meta_memory(action["content"]):
+                print(f"🚫 过滤掉 meta 记忆: {action['content'][:60]}...")
                 continue
-            filtered_memories.append(mem)
-        
-        for mem in filtered_memories:
-            await save_memory(
-                content=mem["content"],
-                importance=mem["importance"],
+
+            if action_type == "create":
+                canonical_key = str(action.get("canonical_key") or "").strip()
+                matched = None
+                if canonical_key:
+                    matched = existing_by_key.get(canonical_key)
+                if not matched:
+                    matched = existing_by_content.get(normalize_text_key(action["content"]))
+
+                if matched:
+                    if has_stable_session_id:
+                        matched_id = row_get(matched, "id")
+                        if matched_id and await add_memory_confirmation(matched_id, session_id):
+                            confirmation_count += 1
+                            await maybe_promote_memory(matched_id)
+                    else:
+                        print("ℹ️  命中已有记忆，但当前请求没有稳定 session_id，跳过 confirm 计数")
+                    continue
+
+                new_memory_id = await save_action_memory(action, session_id)
+                if new_memory_id:
+                    saved_count += 1
+                    fresh_memory = {
+                        "id": new_memory_id,
+                        "content": action["content"],
+                        "canonical_key": action.get("canonical_key"),
+                    }
+                    existing_by_content[normalize_text_key(action["content"])] = fresh_memory
+                    if action.get("canonical_key"):
+                        existing_by_key[action["canonical_key"]] = fresh_memory
+            elif action_type == "confirm":
+                if not has_stable_session_id:
+                    continue
+                memory_id = action.get("memory_id")
+                if memory_id and await add_memory_confirmation(memory_id, session_id):
+                    confirmation_count += 1
+                    await maybe_promote_memory(memory_id)
+            elif action_type == "conflict":
+                await handle_memory_conflict(action, session_id)
+                conflict_count += 1
+
+        loop_creates = extraction_result["open_loops"]["create"]
+        for loop in loop_creates:
+            await create_open_loop(
+                content=loop["content"],
+                loop_type=loop.get("loop_type", "promise"),
                 source_session=session_id,
             )
-        
-        if filtered_memories:
+
+        if extraction_result["open_loops"]["resolve"]:
+            await resolve_open_loops(extraction_result["open_loops"]["resolve"])
+
+        await expire_old_memories()
+        await expire_old_open_loops()
+        if has_stable_session_id:
+            await summarize_stale_sessions()
+
+        if saved_count or confirmation_count or conflict_count or loop_creates or extraction_result["open_loops"]["resolve"]:
             total = await get_all_memories_count()
-            print(f"💾 已保存 {len(filtered_memories)} 条新记忆（过滤了 {len(new_memories) - len(filtered_memories)} 条），总计 {total} 条")
-            
-    except Exception as e:
-        print(f"⚠️  后台记忆处理失败: {e}")
+            print(
+                f"💾 记忆处理完成：新增 {saved_count}，确认 {confirmation_count}，冲突 {conflict_count}，"
+                f"open_loops +{len(loop_creates)} / resolved {len(extraction_result['open_loops']['resolve'])}，总计 {total} 条"
+            )
+
+    except Exception as exc:
+        print(f"⚠️  后台记忆处理失败: {exc}")
 
 
 # ============================================================
@@ -335,25 +703,15 @@ async def chat_completions(request: Request):
     
     body = await request.json()
     messages = body.get("messages", [])
-    
-    # ---------- 提取用户最新消息 ----------
+
     user_message = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                user_message = content
-            elif isinstance(content, list):
-                user_message = " ".join(
-                    item.get("text", "") for item in content
-                    if isinstance(item, dict) and item.get("type") == "text"
-                )
+            user_message = extract_text_from_content(msg.get("content"))
             break
-    
-    # ---------- 构建 system prompt ----------
-    # 先保存原始对话消息（不含 system prompt），用于记忆提取
-    original_messages = [msg for msg in messages if msg.get("role") != "system"]
-    
+
+    original_messages = normalize_messages_for_memory(messages)
+
     if SYSTEM_PROMPT or (MEMORY_ENABLED and user_message):
         if MEMORY_ENABLED and user_message:
             enhanced_prompt = await build_system_prompt_with_memories(user_message)
@@ -377,9 +735,10 @@ async def chat_completions(request: Request):
     if not model:
         model = DEFAULT_MODEL
     body["model"] = model
-    
-    # ---------- 生成 session ID ----------
-    session_id = str(uuid.uuid4())[:8]
+
+    provided_session_id = str(body.pop("session_id", "") or "").strip()
+    has_stable_session_id = bool(provided_session_id)
+    session_id = provided_session_id or str(uuid.uuid4())[:8]
     
     # ---------- 转发请求 ----------
     headers = {
@@ -395,7 +754,15 @@ async def chat_completions(request: Request):
     
     if is_stream:
         return StreamingResponse(
-            stream_and_capture(headers, body, session_id, user_message, model, original_messages),
+            stream_and_capture(
+                headers,
+                body,
+                session_id,
+                user_message,
+                model,
+                original_messages,
+                has_stable_session_id,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -413,7 +780,14 @@ async def chat_completions(request: Request):
                 
                 if MEMORY_ENABLED and user_message and assistant_msg:
                     asyncio.create_task(
-                        process_memories_background(session_id, user_message, assistant_msg, model, context_messages=original_messages)
+                        process_memories_background(
+                            session_id,
+                            user_message,
+                            assistant_msg,
+                            model,
+                            context_messages=original_messages,
+                            has_stable_session_id=has_stable_session_id,
+                        )
                     )
                 
                 return JSONResponse(status_code=200, content=resp_data)
@@ -421,7 +795,15 @@ async def chat_completions(request: Request):
                 return JSONResponse(status_code=response.status_code, content=response.json())
 
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, original_messages: list = None):
+async def stream_and_capture(
+    headers: dict,
+    body: dict,
+    session_id: str,
+    user_message: str,
+    model: str,
+    original_messages: list | None = None,
+    has_stable_session_id: bool = False,
+):
     """流式响应 + 捕获完整回复"""
     full_response = []
     
@@ -443,7 +825,14 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     assistant_msg = "".join(full_response)
     if MEMORY_ENABLED and user_message and assistant_msg:
         asyncio.create_task(
-            process_memories_background(session_id, user_message, assistant_msg, model, context_messages=original_messages)
+            process_memories_background(
+                session_id,
+                user_message,
+                assistant_msg,
+                model,
+                context_messages=original_messages,
+                has_stable_session_id=has_stable_session_id,
+            )
         )
 
 
@@ -476,10 +865,10 @@ async def export_memories():
     
     try:
         memories = await get_all_memories()
-        # 把 datetime 转成字符串
         for mem in memories:
-            if mem.get("created_at"):
-                mem["created_at"] = str(mem["created_at"])
+            for field in ("created_at", "last_accessed", "valid_until"):
+                if mem.get(field):
+                    mem[field] = str(mem[field])
         
         return {
             "total": len(memories),
@@ -862,8 +1251,9 @@ async def api_get_memories():
         return {"error": "记忆系统未启用"}
     memories = await get_all_memories_detail()
     for m in memories:
-        if m.get("created_at"):
-            m["created_at"] = str(m["created_at"])
+        for field in ("created_at", "last_accessed", "valid_until"):
+            if m.get(field):
+                m[field] = str(m[field])
     return {"memories": memories}
 
 
@@ -1011,6 +1401,11 @@ async def import_memories(request: Request):
                 content=content,
                 importance=mem.get("importance", 5),
                 source_session=mem.get("source_session", "json-import"),
+                tier=mem.get("tier", MEMORY_TIER_EPHEMERAL),
+                status=mem.get("status", ACTIVE_STATUS),
+                canonical_key=mem.get("canonical_key"),
+                manual_locked=bool(mem.get("manual_locked", False)),
+                pending_review=bool(mem.get("pending_review", False)),
             )
             imported += 1
         
