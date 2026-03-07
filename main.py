@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
@@ -870,11 +870,16 @@ async def export_memories():
                 if mem.get(field):
                     mem[field] = str(mem[field])
         
-        return {
+        payload = {
             "total": len(memories),
             "exported_at": str(__import__("datetime").datetime.now()),
             "memories": memories,
         }
+        filename = f"memories_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        return JSONResponse(
+            content=payload,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
     except Exception as e:
         return {"error": str(e)}
 
@@ -1245,11 +1250,33 @@ loadMemories();
 # ============================================================
 
 @app.get("/api/memories")
-async def api_get_memories():
-    """获取所有记忆（管理页面用）"""
+async def api_get_memories(
+    search: str = Query(default=""),
+    tier: str = Query(default=""),
+    status: str = Query(default=""),
+):
+    """获取记忆列表（管理页面用），支持 search/tier/status 过滤"""
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
-    memories = await get_all_memories_detail()
+
+    if search.strip():
+        tiers_filter = [tier] if tier.strip() else None
+        rows = await search_memories(search.strip(), limit=200, tiers=tiers_filter, touch=False)
+        memories = [dict(r) for r in rows]
+        # search 结果字段较少，补齐缺失字段
+        for m in memories:
+            for f in ("canonical_key", "manual_locked", "pending_review",
+                      "replaced_by_id", "valid_until", "source_session"):
+                m.setdefault(f, None)
+        if status.strip():
+            memories = [m for m in memories if m.get("status") == status.strip()]
+    else:
+        memories = await get_all_memories_detail()
+        if tier.strip():
+            memories = [m for m in memories if m.get("tier") == tier.strip()]
+        if status.strip():
+            memories = [m for m in memories if m.get("status") == status.strip()]
+
     for m in memories:
         for field in ("created_at", "last_accessed", "valid_until"):
             if m.get(field):
@@ -1418,6 +1445,116 @@ async def import_memories(request: Request):
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+# ============================================================
+# 新增 API：記憶升降級 / 鎖定 / Open Loops / Summaries
+# ============================================================
+
+@app.post("/api/memories/{memory_id}/upgrade")
+async def api_upgrade_memory(memory_id: int, request: Request):
+    """
+    手動升級記憶 tier：
+      ephemeral → stable（直接升）
+      stable → evergreen（標 pending_review=true，等人工確認）
+    """
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    mem = await get_memory(memory_id)
+    if not mem:
+        return JSONResponse({"error": "找不到記憶"}, status_code=404)
+
+    current_tier = mem.get("tier", MEMORY_TIER_EPHEMERAL)
+    if current_tier == MEMORY_TIER_EPHEMERAL:
+        await update_memory(memory_id, tier=MEMORY_TIER_STABLE)
+        return {"status": "ok", "id": memory_id, "new_tier": MEMORY_TIER_STABLE}
+    elif current_tier == MEMORY_TIER_STABLE:
+        await update_memory(memory_id, tier=MEMORY_TIER_EVERGREEN, pending_review=True)
+        return {"status": "ok", "id": memory_id, "new_tier": MEMORY_TIER_EVERGREEN, "pending_review": True}
+    else:
+        return {"status": "already_top", "id": memory_id, "tier": current_tier}
+
+
+@app.post("/api/memories/{memory_id}/lock")
+async def api_toggle_lock(memory_id: int):
+    """切換 manual_locked（鎖定/解鎖）"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    mem = await get_memory(memory_id)
+    if not mem:
+        return JSONResponse({"error": "找不到記憶"}, status_code=404)
+    new_locked = not bool(mem.get("manual_locked", False))
+    await update_memory(memory_id, manual_locked=new_locked)
+    return {"status": "ok", "id": memory_id, "manual_locked": new_locked}
+
+
+@app.get("/api/open-loops")
+async def api_get_open_loops(status: str = Query(default="open")):
+    """取得 Open Loops 列表，預設只取 open 狀態；傳 status=all 取全部"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    if status == "all":
+        # 全部狀態
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, content, loop_type, source_session, status, resolved_at, created_at
+                FROM open_loops
+                ORDER BY created_at DESC
+                LIMIT 200
+                """
+            )
+    else:
+        rows = await get_open_loops(status=status, limit=200)
+    loops = []
+    for r in rows:
+        d = dict(r)
+        for f in ("resolved_at", "created_at"):
+            if d.get(f):
+                d[f] = str(d[f])
+        loops.append(d)
+    return {"loops": loops}
+
+
+@app.patch("/api/open-loops/{loop_id}")
+async def api_patch_open_loop(loop_id: int, request: Request):
+    """更新 open loop 狀態：resolved / dropped"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    data = await request.json()
+    new_status = data.get("status", "resolved")
+    if new_status not in ("resolved", "dropped", "open"):
+        return JSONResponse({"error": "status 只能是 resolved / dropped / open"}, status_code=400)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        resolved_at_sql = "NOW()" if new_status == "resolved" else "NULL"
+        await conn.execute(
+            f"""
+            UPDATE open_loops
+            SET status = $1, resolved_at = {resolved_at_sql}
+            WHERE id = $2
+            """,
+            new_status,
+            loop_id,
+        )
+    return {"status": "ok", "id": loop_id, "new_status": new_status}
+
+
+@app.get("/api/summaries")
+async def api_get_summaries(limit: int = Query(default=50)):
+    """取得最近 N 筆 session 摘要"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    rows = await get_recent_session_summaries(limit=min(limit, 200))
+    summaries = []
+    for r in rows:
+        d = dict(r)
+        for f in ("created_at", "updated_at"):
+            if d.get(f):
+                d[f] = str(d[f])
+        summaries.append(d)
+    return {"summaries": summaries}
 
 
 # ============================================================
