@@ -739,7 +739,9 @@ async def chat_completions(request: Request):
     provided_session_id = str(body.pop("session_id", "") or "").strip()
     has_stable_session_id = bool(provided_session_id)
     session_id = provided_session_id or str(uuid.uuid4())[:8]
-    
+
+    print(f"📨 [{session_id[:8]}] {local_now().strftime('%m-%d %H:%M')} 收到訊息（{len(user_message)} 字）")
+
     # ---------- 转发请求 ----------
     headers = {
         "Authorization": f"Bearer {API_KEY}",

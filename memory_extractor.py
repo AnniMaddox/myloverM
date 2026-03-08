@@ -390,6 +390,7 @@ async def extract_memory_actions(
         return result
     except json.JSONDecodeError as exc:
         print(f"⚠️  记忆动作 JSON 解析失败: {exc}")
+        print(f"🔍 模型原始回傳: {text[:400]}")
         return {
             "memory_actions": [],
             "open_loops": {"create": [], "resolve": []},

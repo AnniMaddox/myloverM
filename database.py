@@ -22,6 +22,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 WEIGHT_KEYWORD = float(os.getenv("WEIGHT_KEYWORD", "0.5"))
 WEIGHT_IMPORTANCE = float(os.getenv("WEIGHT_IMPORTANCE", "0.3"))
 WEIGHT_RECENCY = float(os.getenv("WEIGHT_RECENCY", "0.2"))
+MIN_SCORE_THRESHOLD = float(os.getenv("MIN_SCORE_THRESHOLD", "0.1"))
 
 ACTIVE_STATUS = "active"
 MEMORY_TIER_EVERGREEN = "evergreen"
@@ -593,6 +594,9 @@ async def search_memories(
     pool = await get_pool()
     async with pool.acquire() as conn:
         results = await conn.fetch(sql, *params)
+
+    if MIN_SCORE_THRESHOLD > 0:
+        results = [r for r in results if (r["score"] or 0) >= MIN_SCORE_THRESHOLD]
 
     if results and touch:
         await touch_memories([r["id"] for r in results])
