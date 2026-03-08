@@ -1,215 +1,227 @@
-# 🧠 AI Memory Gateway
+# 🧠 AI Memory Gateway — myloverM
 
-**让你的 AI 拥有长期记忆。**
+**讓 AI 擁有長期記憶的輕量轉發網關。**
 
-一个轻量级转发网关，在你和 LLM 之间加一层记忆系统。支持任何 OpenAI 兼容客户端（Kelivo、ChatBox、NextChat 等）和任何 LLM 服务商（OpenRouter、OpenAI、本地 Ollama 等）。
-
-Give your AI long-term memory. A lightweight proxy gateway that adds a memory layer between you and any LLM.
+在你和 LLM 之間加一層記憶系統，讓 M 跨視窗、跨對話都記得你說過的事。
 
 ---
 
 ## ✨ 功能
 
-- **自定义人设** — 把你的 system prompt 写在 `system_prompt.txt`，每次对话自动注入
-- **长期记忆** — 自动从对话中提取关键信息，下次聊天时自动回忆相关内容
-- **预置记忆** — 把你想让 AI "一开始就知道"的事情批量导入
-- **兼容性强** — 支持所有 OpenAI 格式的客户端和 API 服务商
-- **零成本起步** — 可部署在 Zeabur 等平台的免费额度内
-
-## 🏗️ 架构
-
-```
-你的客户端（Kelivo / ChatBox / ...）
-        ↓
-   AI Memory Gateway（本项目）
-   ├── 注入 system prompt（人设）
-   ├── 搜索相关记忆 → 注入上下文
-   ├── 转发请求 → LLM API
-   └── 后台提取新记忆 → 存入数据库
-        ↓
-   LLM API（OpenRouter / OpenAI / Ollama / ...）
-```
-
-## 🚀 快速开始
-
-### 第一阶段：纯转发网关（不需要数据库）
-
-最简单的起步方式——先跑通网关，确认你的客户端能通过网关和 AI 对话。
-
-**1. 准备文件**
-
-你只需要这几个文件：
-- `main.py` — 网关主程序
-- `system_prompt.txt` — 你的 AI 人设（可选）
-- `requirements.txt` — Python 依赖
-- `Dockerfile` — 容器配置
-
-**2. 修改人设**
-
-编辑 `system_prompt.txt`，写入你想要的 AI 性格设定。
-
-**3. 部署到 Zeabur（推荐）**
-
-1. Fork 或上传代码到你的 GitHub 私有仓库
-2. 注册 [Zeabur](https://zeabur.com)（每月 $5 免费额度，够用）
-3. 创建项目 → 添加服务 → 连接 GitHub 仓库
-4. 设置环境变量：
-
-| 环境变量 | 说明 | 示例 |
-|---------|------|------|
-| `API_KEY` | 你的 LLM API Key | `sk-or-v1-xxxx`（OpenRouter）|
-| `API_BASE_URL` | LLM API 地址 | `https://openrouter.ai/api/v1/chat/completions` |
-| `DEFAULT_MODEL` | 默认模型 | `anthropic/claude-sonnet-4` |
-| `PORT` | 端口 | `8080` |
-
-5. 部署，访问你的网关地址看到 `{"status":"running"}` 就成功了
-
-**4. 连接客户端**
-
-以 Kelivo 为例：
-- API 地址填：`https://你的网关地址.zeabur.app/v1`
-- API Key 填：随便填一个（网关会用自己的 key）
-- 模型填：你在 `DEFAULT_MODEL` 里设的模型
-
-### 第二阶段：加上记忆系统
-
-在第一阶段基础上，加一个 PostgreSQL 数据库就能开启记忆功能。
-
-**1. 创建数据库**
-
-在 Zeabur 中：添加服务 → Marketplace → PostgreSQL
-
-**2. 添加环境变量**
-
-| 环境变量 | 说明 | 示例 |
-|---------|------|------|
-| `DATABASE_URL` | PostgreSQL 连接字符串 | `postgresql://user:pass@host:port/db` |
-| `MEMORY_ENABLED` | 开启记忆 | `true` |
-| `MEMORY_MODEL` | 提取记忆用的模型（推荐便宜的小模型） | `anthropic/claude-haiku-4` |
-| `MAX_MEMORIES_INJECT` | 每次注入的最大记忆条数 | `15` |
-| `MEMORY_EXTRACT_INTERVAL` | 记忆提取间隔（0=禁用/1=每轮/N=每N轮） | `1` |
-| `TIMEZONE_HOURS` | 时区偏移（小时），用于记忆注入时的日期显示 | `8`（UTC+8） |
-
-**3. 重新部署**
-
-部署后访问 `https://你的网关地址.zeabur.app/manage/memories`，能正常打开管理页面就说明数据库连接成功。
-
-**4. 导入预置记忆（可选）**
-
-**方式一（推荐，不用碰代码）：** 写一个 `.txt` 文件，每行一条你想让 AI 知道的信息，然后打开 `https://你的网关地址.zeabur.app/import/memories`，在"纯文本导入"标签页上传文件，系统会自动评估每条记忆的重要程度并导入。也可以勾选"跳过自动评分"节省 API 额度，之后在管理页面手动调整权重。
-
-**方式二（代码方式，开发者用）：**
-1. 复制 `seed_memories_example.py` 为 `seed_memories.py`
-2. 修改里面的记忆条目，写入你想让 AI 一开始就知道的信息
-3. 部署后访问 `https://你的网关地址.zeabur.app/import/seed-memories`，看到 `"status": "done"` 就导入成功了
-
-**5. 管理记忆（可选）**
-
-打开 `https://你的网关地址.zeabur.app/manage/memories` 可以查看所有记忆，支持搜索、编辑内容、调整权重、单条删除和批量删除。
-
-### 第三阶段：关闭记忆（应急）
-
-如果记忆系统出问题，把环境变量 `MEMORY_ENABLED` 改回 `false` 即可退回纯转发模式。不需要改代码。
-
-## 📁 文件说明
-
-```
-ai-memory-gateway/
-├── main.py                    # 网关主程序
-├── database.py                # 数据库操作（PostgreSQL）
-├── memory_extractor.py        # AI 记忆提取
-├── system_prompt.txt          # 你的 AI 人设（自行编辑）
-├── seed_memories_example.py   # 预置记忆示例
-├── requirements.txt           # Python 依赖
-├── Dockerfile                 # 容器配置
-├── LICENSE                    # MIT 许可证
-└── README.md                  # 本文件
-```
-
-## 🔧 API 接口
-
-| 路径 | 方法 | 说明 |
-|------|------|------|
-| `/` | GET | 健康检查，查看网关状态 |
-| `/v1/chat/completions` | POST | 核心转发接口（OpenAI 兼容） |
-| `/v1/models` | GET | 模型列表 |
-| `/import/memories` | GET/POST | 记忆导入页面（支持纯文本自动评分 / JSON备份恢复） |
-| `/manage/memories` | GET | 记忆管理页面（查看、搜索、编辑、删除） |
-| `/export/memories` | GET | 导出所有记忆为 JSON（备份/迁移） |
-| `/import/seed-memories` | GET | 执行预置记忆导入（开发者用） |
-
-## 🌐 支持的 LLM 服务商
-
-只要兼容 OpenAI 聊天格式就行。改 `API_BASE_URL` 环境变量即可切换：
-
-| 服务商 | API_BASE_URL |
-|--------|-------------|
-| OpenRouter | `https://openrouter.ai/api/v1/chat/completions` |
-| OpenAI | `https://api.openai.com/v1/chat/completions` |
-| Ollama（本地） | `http://localhost:11434/v1/chat/completions` |
-| 其他兼容服务 | 查阅对应文档 |
-
-> ⚠️ 部分 Gemini preview 模型（如 `gemini-3-flash-preview`）可能存在流式输出兼容性问题导致空回复，建议使用正式版模型（如 `gemini-2.5-flash`）。
-
-## 💡 记忆系统原理
-
-1. **你发消息** → 网关从数据库搜索相关记忆
-2. **记忆注入** → 相关记忆 + 记忆应用规则拼接到 system prompt 后面
-3. **AI 回复** → 网关边转发边捕获完整回复
-4. **后台提取** → 用小模型（如 Haiku）从完整对话上下文中提取关键信息
-5. **存入数据库** → 下次对话时可以检索到
-
-提取记忆时，网关会把客户端发来的完整对话上下文（不含 system prompt）传给提取模型，这样能捕捉到跨轮次的信息。通过 `MEMORY_EXTRACT_INTERVAL` 可以控制提取频率：设为 0 禁用自动提取，设为 1 每轮都提，设为 N 则每 N 轮提取一次（适合控制成本）。
-
-> **关于向量搜索：** 当前版本使用关键词匹配（中文 bigram 分词 + ILIKE），适合记忆量在几百条以内的场景。如果记忆量增长到上千条且需要语义搜索（比如说"过年"能搜到"春节"），可以加装 pgvector 扩展做 embedding 向量检索。`database.py` 的 `search_memories` 函数预留了权重配置，加一路向量分数即可。
-
-## ❓ 常见问题
-
-**Q: 部署后访问显示 502？**
-A: 检查端口设置。Zeabur 默认用 8080，确保环境变量 `PORT=8080`。
-
-**Q: 数据库连接失败？**
-A: Zeabur 的 PostgreSQL 需要 SSL。在连接字符串末尾加 `?sslmode=require`。
-
-**Q: 记忆会越来越多影响性能吗？**
-A: 每次最多注入 15 条记忆（可调），不会无限增长地消耗 token。提取记忆时会用客户端发来的完整上下文，token 用量比单轮提取大一些，可以通过 `MEMORY_EXTRACT_INTERVAL` 降低提取频率来控制成本。
-
-**Q: 能用免费额度跑吗？**
-A: Zeabur 每月 $5 免费额度，网关 + PostgreSQL 的资源消耗很低，够用。LLM API 费用另算（推荐 OpenRouter，按量付费）。
-
-**Q: 怎么备份记忆？换平台会丢数据吗？**
-A: 访问 `https://你的网关地址.zeabur.app/export/memories` 导出所有记忆的 JSON，建议定期备份。迁移到新平台后，浏览器打开 `https://新网关地址/import/memories`，在"JSON 备份恢复"标签页上传导出的文件即可。
-
-**Q: 不会写代码能搞吗？**
-A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
-
-## 📋 更新日志
-
-### v2.0（2026-03-01）
-
-- **记忆提取间隔** — 新增 `MEMORY_EXTRACT_INTERVAL` 环境变量，可设置每 N 轮提取一次记忆或禁用自动提取，方便控制 API 成本
-- **完整上下文提取** — 提取记忆时不再只看最新一轮对话，而是使用客户端发来的完整对话上下文，能捕捉到跨轮次的信息
-- **优化记忆注入提示词** — 注入的记忆附带应用规则和交流方式指引，让 AI 更自然地运用记忆而非机械引用
-
-### v1.0（2026-02-26）
-
-- 初始版本
-- 支持自定义人设、长期记忆、预置记忆导入
-- 支持 OpenRouter / OpenAI / Ollama 等 LLM 服务商
-- 支持 Kelivo / ChatBox / NextChat 等 OpenAI 兼容客户端
-- 记忆管理页面（查看、编辑、删除、批量操作）
-- 记忆导入/导出（纯文本 + JSON 备份恢复）
-
-## 📄 许可证
-
-[MIT License](LICENSE) — 随便用，改了也不用告诉我。
-
-## 🙏 致谢
-
-这个项目诞生于一个简单的需求：**让 AI 不要每次醒来都忘了我是谁。**
-
-> "记忆库不是数据库，是家。"
+- **自定義人設** — `system_prompt.txt` 每次對話自動注入
+- **三層記憶系統** — ephemeral（短期）/ stable（穩定）/ evergreen（長期），自動升降級
+- **Open Loops** — 追蹤未解決的事，下次聊自動提醒
+- **Session 摘要** — 閒置 30 分鐘後自動壓縮對話，讓記憶跨越視窗
+- **專屬聊天前端** — 部署在 `docs/m/`，手機友善
+- **記憶室 APP** — Our-love 主頁可進入記憶管理介面
 
 ---
 
-*Built with love by 七堂伽蓝_ & Midsummer (Claude Opus 4.6)*
+## 🏗️ 每次送出去的東西
+
+每一輪對話送給 AI 的完整內容：
+
+```
+[system 訊息]
+  system_prompt.txt 全文
+  + 【核心長期記憶】evergreen，最多 MAX_EVERGREEN_INJECT 條（預設 12）
+  + 【相關穩定記憶】stable，語意搜尋後最相關 MAX_MEMORIES_INJECT 條（預設 8）
+  + 【近期摘要】最近 MAX_SUMMARIES_INJECT 份 session 摘要（預設 2）
+  + 【Open Loops】最多 MAX_OPEN_LOOPS_INJECT 個未解決事項（預設 8）
+  + 【近期短期狀態】ephemeral 最新 MAX_EPHEMERAL_INJECT 條（預設 8）
+
+[對話歷史]
+  前端送來的 N 輪對話（可在聊天介面設定截斷輪數）
+```
+
+M 每次回覆後，後端會額外發一次 API 呼叫給記憶萃取模型，分析「有沒有值得存的事」，這次只帶那幾輪對話（不含 system），所以很輕。
+
+---
+
+## 🏗️ 架構
+
+```
+使用者（瀏覽器 docs/m/）
+        ↓ POST /v1/chat/completions
+   AI Memory Gateway（Railway）
+   ├── 從 DB 搜尋相關記憶
+   ├── 拼裝 system prompt（人設 + 記憶 + open loops + 摘要）
+   ├── 轉發請求 → OpenAI / OpenRouter
+   └── 回覆後非同步：提取記憶 + 存入 DB + 處理 stale sessions
+        ↓
+   PostgreSQL（Railway）
+        ↓
+   docs/m/（GitHub Pages）← 前端
+   Our-love 記憶室 APP ← 記憶管理
+```
+
+---
+
+## 🚀 部署（Railway）
+
+### 第一步：基本部署
+
+1. Fork 此 repo 到你的 GitHub（建議設 Private）
+2. 到 [Railway](https://railway.app) 新增服務 → 連接 GitHub repo
+3. 設定環境變數：
+
+| 環境變數 | 說明 | 範例 |
+|---------|------|------|
+| `API_KEY` | 你的 LLM API Key | `sk-xxxx` |
+| `API_BASE_URL` | LLM API 地址 | `https://api.openai.com/v1/chat/completions` |
+| `DEFAULT_MODEL` | 預設模型 | `gpt-4o-2024-11-20` |
+| `PORT` | 端口 | `8080` |
+
+4. 部署完訪問 `https://你的服務.up.railway.app/`，看到 `{"status":"running"}` 就成功
+
+### 第二步：開啟記憶系統
+
+在 Railway 新增 PostgreSQL 服務，然後加環境變數：
+
+| 環境變數 | 說明 | 預設值 |
+|---------|------|--------|
+| `DATABASE_URL` | PostgreSQL 連接字串 | — |
+| `MEMORY_ENABLED` | 開啟記憶 | `false` |
+| `MEMORY_MODEL` | 記憶萃取用的模型（推薦小模型省成本） | `gpt-4o-mini` |
+| `MAX_MEMORIES_INJECT` | stable 記憶最多注入幾條 | `8` |
+| `MAX_EVERGREEN_INJECT` | evergreen 記憶最多注入幾條 | `12` |
+| `MAX_EPHEMERAL_INJECT` | ephemeral 記憶最多注入幾條 | `8` |
+| `MAX_SUMMARIES_INJECT` | session 摘要最多注入幾份 | `2` |
+| `MAX_OPEN_LOOPS_INJECT` | open loops 最多注入幾條 | `8` |
+| `MEMORY_EXTRACT_INTERVAL` | 幾輪提取一次記憶（0=停用，1=每輪，N=每N輪） | `1` |
+| `TIMEZONE_HOURS` | 時區偏移小時（台灣填 8） | `8` |
+| `CORS_ORIGINS` | 允許的前端來源，逗號分隔 | — |
+
+---
+
+## 🧠 三層記憶系統
+
+| 層級 | 說明 | 注入方式 |
+|------|------|---------|
+| **ephemeral**（短期） | 最近提取的狀態、事件 | 直接取最新 N 條 |
+| **stable**（穩定） | 重複出現或手動升級的記憶 | 語意搜尋，取最相關 N 條 |
+| **evergreen**（長期） | 核心關係事實，手動審核確認 | 全取，優先注入 |
+
+**升級路徑：** ephemeral → stable → evergreen（需人工確認）
+
+**鎖定（manual_locked）：** 鎖定的記憶不會被自動覆蓋或清除。
+
+**Open Loops：** AI 偵測到「未解決的事」自動建立，resolved 或 dropped 後不再注入。
+
+**Session 摘要：** 閒置 30 分鐘後，後端自動把那段對話壓縮成摘要存入 DB，下次對話注入。
+
+---
+
+## 📱 聊天前端（docs/m/）
+
+部署在 GitHub Pages 的 `docs/m/`，手機友善。
+
+**設定方式：** 點右上角 ⋯ → System tab
+- **後端 URL**：填 Railway 根網址（不含 /v1）
+- **Model**：留空用後端預設，或手動填
+- **上下文輪數**：0=不截斷，設 N 則每次只送最近 N 輪給 M（超出的靠記憶補充）
+
+---
+
+## 📁 檔案說明
+
+```
+myloverM/
+├── main.py                 # 網關主程序（API endpoints + chat 處理）
+├── database.py             # 資料庫操作（PostgreSQL，含 init_tables）
+├── memory_extractor.py     # AI 記憶萃取
+├── system_prompt.txt       # M 的人設（自行編輯）
+├── requirements.txt        # Python 依賴
+├── Dockerfile              # 容器配置
+├── frontend/               # 聊天前端（React + Vite）
+│   └── src/
+│       ├── components/
+│       │   ├── ChatWindow.tsx   # 主要聊天視窗（含截斷邏輯）
+│       │   ├── SidePanel.tsx    # 右側設定面板
+│       │   ├── ChatSidebar.tsx  # 左側對話列表
+│       │   └── MessageList.tsx  # 訊息氣泡
+│       ├── api.ts          # 後端 API 呼叫集中處
+│       ├── session.ts      # Session 管理（30min timeout）
+│       └── types.ts        # TypeScript 型別定義
+└── README.md
+```
+
+---
+
+## 🔧 API 端點
+
+| 路徑 | 方法 | 說明 |
+|------|------|------|
+| `/` | GET | 健康檢查，查看網關狀態 |
+| `/v1/chat/completions` | POST | 主聊天介面（OpenAI 格式） |
+| `/v1/models` | GET | 取得後端 model 名稱 |
+| `/api/memories` | GET | 列出記憶（支援 ?search= ?tier= ?status=） |
+| `/api/memories/{id}/upgrade` | POST | 升級記憶層級 |
+| `/api/memories/{id}/lock` | POST | 切換鎖定狀態 |
+| `/api/memories/{id}` | DELETE | 刪除記憶 |
+| `/api/open-loops` | GET | 列出 open loops（?status=open\|all） |
+| `/api/open-loops/{id}` | PATCH | 更新 loop 狀態（resolved/dropped/open） |
+| `/api/summaries` | GET | 列出 session 摘要（?limit=50） |
+| `/export/memories` | GET | 匯出所有記憶 JSON（備份用） |
+| `/import/memories` | GET/POST | 記憶匯入頁面（純文字 / JSON 備份還原） |
+
+---
+
+## 💾 localStorage 鍵值（前端）
+
+| 鍵 | 說明 |
+|----|------|
+| `myloverM-api-base-url` | 後端 Railway URL |
+| `myloverM-model` | 指定模型（留空用後端預設） |
+| `myloverM-context-turns` | 上下文截斷輪數（0=不截斷） |
+| `myloverM_chats` | 對話紀錄（可在記憶室匯出備份） |
+
+---
+
+## ❓ 常見問題
+
+**Q: 部署後訪問 502？**
+A: 確認 `PORT=8080`，Railway 預設用 8080。
+
+**Q: CORS 錯誤？**
+A: 在 Railway 加 `CORS_ORIGINS=https://你的前端網域` 環境變數。
+
+**Q: 記憶越來越多，token 會爆嗎？**
+A: 每次最多注入固定條數（預設合計約 36 條，~3200 token），不會無限增長。
+
+**Q: 上下文截斷後 M 會失憶嗎？**
+A: 不會完全失憶。每輪萃取的 ephemeral 記憶持續存入 DB，舊對話會被摘要，都會在下次注入。截斷主要是省 token 用的。
+
+**Q: 怎麼備份？**
+A: 記憶：`/export/memories` 下載 JSON。對話紀錄：記憶室 APP → 備份 tab → 匯出對話。
+
+---
+
+## 📋 更新日誌
+
+### v3.0（2026-03-08）
+
+- **前端聊天介面** — 部署在 `docs/m/`，含左側列表、右側設定面板、streaming
+- **上下文截斷** — 聊天前端可設定最多送幾輪對話，省 token
+- **記憶室 APP** — Our-love 主頁新增記憶管理 APP，可管理記憶/待審/Loops/備份
+- **新增 API** — `/api/memories`、`/api/open-loops`、`/api/summaries`（支援記憶室）
+- **匯出修正** — `/export/memories` 加 `Content-Disposition: attachment` header
+- **回傳按鈕** — 聊天頁加 ‹ 返回鍵，可回到 Our-love 主頁
+- **測試頁連結** — System 面板加入測試頁快速入口
+
+### v2.0（2026-03-01）
+
+- **三層記憶架構** — ephemeral / stable / evergreen 分層管理
+- **Open Loops** — 未解決事項自動追蹤
+- **Session 摘要** — 閒置 30 分鐘自動摘要
+- **記憶提取間隔** — `MEMORY_EXTRACT_INTERVAL` 環境變數
+- **完整上下文提取** — 記憶萃取帶入最近幾輪對話，不只看最後一輪
+
+### v1.0（2026-02-26）
+
+- 初始版本：自定義人設、長期記憶、預置記憶匯入
+- 支援 OpenRouter / OpenAI 等 LLM 服務商
+
+---
+
+*Built with love by 七堂伽蓝_ & Midsummer (Claude Sonnet 4.6)*

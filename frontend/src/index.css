@@ -1,0 +1,114 @@
+/* ============================================================
+   全域 CSS — CSS variables + reset
+   所有顏色都走 variable，之後加淺色模式只要換一組值
+   ============================================================ */
+
+:root {
+  /* ── 背景層次（深色暖調） ── */
+  --bg-base:     #1a1712;   /* 最底層，整個 app 背景 */
+  --bg-surface:  #211d17;   /* 左側 sidebar、右側 panel */
+  --bg-elevated: #2b2620;   /* 卡片、hover 前的靜止狀態 */
+  --bg-hover:    #342e27;   /* hover */
+  --bg-active:   #3e3830;   /* selected / active */
+
+  /* ── 邊框 ── */
+  --border:        #38322b;
+  --border-subtle: #2c2720;
+
+  /* ── 文字 ── */
+  --text-primary:     #ede8df;   /* 主要內容 */
+  --text-secondary:   #a09280;   /* 說明、時間戳 */
+  --text-muted:       #6a6058;   /* 非常淡的輔助文字 */
+  --text-placeholder: #504840;
+
+  /* ── 強調色（暖琥珀） ── */
+  --accent:     #c9a87c;
+  --accent-dim: #8b7050;
+  --accent-bg:  #3d3020;   /* 強調色背景（按鈕 hover 等） */
+
+  /* ── 訊息氣泡 ── */
+  --bubble-user-bg:   #6b4f35;   /* 使用者，右側，暖棕 */
+  --bubble-user-text: #fdf0e0;
+  --bubble-ai-bg:     #2e2924;   /* M，左側，深暖灰（像 iMessage 灰） */
+  --bubble-ai-text:   #e8e0d5;
+
+  /* ── 狀態色 ── */
+  --color-error:   #d97070;
+  --color-success: #8bba8b;
+  --color-warning: #c9a87c;   /* 跟 accent 同色 */
+
+  /* ── 版型尺寸 ── */
+  --sidebar-w:  260px;
+  --panel-w:    280px;
+
+  /* ── 動畫 ── */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+
+  /* ── 字體 ── */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', monospace;
+
+  /* ── 圓角 ── */
+  --radius-sm:  6px;
+  --radius-md:  10px;
+  --radius-lg:  16px;
+  --radius-xl:  22px;
+}
+
+/* ── Reset ── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+input, textarea {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  outline: none;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+/* ── Scrollbar（Webkit） ── */
+::-webkit-scrollbar {
+  width: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-dim);
+}
