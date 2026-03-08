@@ -205,7 +205,7 @@ export default function SidePanel({ activeChat, onClose }: Props) {
               <input
                 type="range"
                 min={0}
-                max={60}
+                max={999}
                 step={1}
                 value={contextTurns}
                 onChange={(e) => handleContextTurnsChange(Number(e.target.value))}
